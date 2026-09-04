@@ -33,11 +33,17 @@ const koffiVariants = [
   ],
 ];
 const koffiMatches = koffiVariants.filter(([before]) => koffiSource.split(before).length - 1 === 1);
-if (koffiMatches.length !== 1) {
+if (koffiMatches.length === 1) {
+  await writeFile(koffiFilename, koffiSource.replace(...koffiMatches[0]));
+  console.log("patched: koffi: use fstatat fallback on Android");
+} else if (koffiMatches.length > 1) {
   throw new Error(`koffi: expected exactly one known statx condition in ${koffiPath}, found ${koffiMatches.length}`);
+} else if (koffiSource.includes("syscall(__NR_statx") && koffiSource.includes("case ENOSYS: goto fallback")) {
+  // koffi >= 3.2.0: raw syscall(__NR_statx) + ENOSYS fallback 已在源码原生处理 Android statx, 无需补丁
+  console.log("skipped: koffi: statx handled natively by upstream (>= 3.2.0)");
+} else {
+  throw new Error(`koffi: no known statx condition and no modern fallback in ${koffiPath}`);
 }
-await writeFile(koffiFilename, koffiSource.replace(...koffiMatches[0]));
-console.log("patched: koffi: use fstatat fallback on Android");
 
 await replaceOnce(
   koffiPath,

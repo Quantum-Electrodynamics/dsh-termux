@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
-import { access, readFile } from "node:fs/promises";
+import { access, readFile, readdir as readdirAsync } from "node:fs/promises";
+import { readdirSync } from "node:fs";
 import { join } from "node:path";
 
 const [root, expectedVersion] = process.argv.slice(2);
@@ -25,7 +26,7 @@ for (const relativePath of required) {
 }
 
 const profileFiles = [];
-for (const name of await (await import("node:fs/promises")).readdir(join(root, "lib"))) {
+for (const name of await readdirAsync(join(root, "lib"))) {
   if (!/^profile-boot-.*\.js$/.test(name)) continue;
   const source = await readFile(join(root, "lib", name), "utf8");
   if (source.includes("watchUserPatches(ctx")) profileFiles.push(name);
@@ -44,4 +45,61 @@ for (const [relativePath, needle] of checks) {
   if (!source.includes(needle)) throw new Error(`missing patch marker in ${relativePath}`);
 }
 
-console.log(`verified ${manifest.name}@${manifest.version}`);
+// ---- closure integrity gate ----
+// npm pack's bundledDependencies semantics only bundle direct dependencies and can
+// silently drop packages that resolved as transitive-only (0.1.2-rc.1 lost
+// @deepseek-ai/dsh-settings, dsh-bash-local, dsh-session-query this way while every
+// patch marker still matched). This gate checks HOST-side runtime imports only:
+// every `@deepseek-ai/...` import referenced by root lib and the @deepseek-ai packages
+// (excluding browser-bundle files, which resolve through the bundler with its own
+// aliases) must exist in node_modules/@deepseek-ai. Bare specifiers are skipped: they
+// may legitimately be nested or bundler-aliased, and were not the failure mode here.
+const requiredCore = ["@deepseek-ai/dsh-settings", "@deepseek-ai/dsh-bash-local", "@deepseek-ai/dsh-session-query"];
+for (const pkg of requiredCore) {
+  await access(join(root, "node_modules", ...pkg.split("/")));
+}
+
+// every @deepseek-ai package present at node_modules top level
+const present = new Set();
+for (const entry of readdirSync(join(root, "node_modules"), { withFileTypes: true })) {
+  if (entry.isDirectory() && entry.name.startsWith("@")) {
+    for (const sub of readdirSync(join(root, "node_modules", entry.name), { withFileTypes: true })) {
+      if (sub.isDirectory()) present.add(`${entry.name}/${sub.name}`);
+    }
+  }
+}
+
+function* walkHostJs(dir) {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (entry.name === ".bin" || entry.name === "node_modules" || entry.name === "client") continue;
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      yield* walkHostJs(full);
+    } else if (/\.(js|mjs|cjs)$/.test(entry.name) && entry.name !== "client.js") {
+      yield full;
+    }
+  }
+}
+
+const importRe = /(?:from\s+|import\s*\(\s*|require\s*\(\s*|(?:^|\n)\s*import\s+)(["'])([^"']+)\1/g;
+const missing = new Map();
+for (const scanRoot of [join(root, "lib"), join(root, "node_modules", "@deepseek-ai")]) {
+  for (const file of walkHostJs(scanRoot)) {
+    const source = await readFile(file, "utf8");
+    for (const [, , spec] of source.matchAll(importRe)) {
+      if (!spec.startsWith("@deepseek-ai/") || spec.includes("${")) continue;
+      const pkg = spec.split("/").slice(0, 2).join("/");
+      if (present.has(pkg)) continue;
+      if (!missing.has(pkg)) missing.set(pkg, new Set());
+      missing.get(pkg).add(file.slice(root.length + 1));
+    }
+  }
+}
+if (missing.size > 0) {
+  const lines = [...missing.entries()].map(
+    ([name, files]) => `  ${name} <- ${[...files].slice(0, 3).join(", ")}${files.size > 3 ? "..." : ""}`
+  );
+  throw new Error(`closure integrity failed, unresolvable @deepseek-ai imports:\n${lines.join("\n")}`);
+}
+
+console.log(`verified ${manifest.name}@${manifest.version} (${manifest.bundledDependencies?.length ?? 0} bundled deps, closure ok)`);

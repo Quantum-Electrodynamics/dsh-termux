@@ -118,7 +118,14 @@ node scripts/verify-package.mjs "$PACKAGE_DIR" "$TERMUX_VERSION"
 file "$NODE_PTY/prebuilds/android-arm64/pty.node" | grep -F "ARM aarch64"
 file "$KOFFI/build/koffi/android_arm64/koffi.node" | grep -F "ARM aarch64"
 
-(cd "$PACKAGE_DIR" && npm pack --pack-destination "$OUTPUT_DIR")
+# npm pack's bundledDependencies semantics only bundle direct dependencies and can
+# silently drop transitive-only packages (0.1.2-rc.1 lost @deepseek-ai/dsh-settings,
+# dsh-bash-local, dsh-session-query this way while every patch marker still matched).
+# Pack the whole offline tree directly instead.
+(cd "$PACKAGE_DIR" \
+  && tar --exclude='./node_modules/.package-lock.json' \
+         -czf "$OUTPUT_DIR/dsh-termux-${TERMUX_VERSION}.tgz" \
+         --transform='s|^\./|package/|' .)
 tar -tzf "$OUTPUT_DIR/dsh-termux-${TERMUX_VERSION}.tgz" \
   | grep -Fx "package/node_modules/node-pty/prebuilds/android-arm64/pty.node"
 (cd "$OUTPUT_DIR" && sha256sum "dsh-termux-${TERMUX_VERSION}.tgz" > "dsh-termux-${TERMUX_VERSION}.tgz.sha256")

@@ -199,8 +199,25 @@ else
     if [[ -n "${NODE_PTY_PREBUILD_URL:-}" ]]; then
       # CI has no dsh-termux installed to copy from, so the binary is fetched from a published
       # release and still checked against NODE_PTY_PREBUILD_SHA256 below.
+      #
+      # The release publishes a tarball, not a bare pty.node, so the download is usually a gzip
+      # stream that has to be unpacked before it is a usable addon - writing it straight to
+      # $NODE_PTY_PREBUILD would put a 50MB archive where a .node belongs and fail the sha256 check
+      # with a mismatch that looks like a corrupted binary. Sniff the magic bytes instead of trusting
+      # the URL, and always hash the extracted addon, never the container it arrived in.
       echo "node-pty: downloading android-arm64 prebuild from $NODE_PTY_PREBUILD_URL"
-      curl -fsSL "$NODE_PTY_PREBUILD_URL" -o "$NODE_PTY_PREBUILD"
+      downloaded="$BUILD_ROOT/node-pty-prebuild-download"
+      curl -fsSL "$NODE_PTY_PREBUILD_URL" -o "$downloaded"
+      if [[ "$(head -c 2 "$downloaded" | od -An -tx1 | tr -d ' \n')" == "1f8b" ]]; then
+        member="package/node_modules/node-pty/prebuilds/android-arm64/pty.node"
+        if ! tar -xzOf "$downloaded" "$member" > "$NODE_PTY_PREBUILD" 2>/dev/null; then
+          echo "node-pty: downloaded archive contains no $member" >&2
+          exit 1
+        fi
+        echo "node-pty: extracted $member from the downloaded archive"
+      else
+        cp "$downloaded" "$NODE_PTY_PREBUILD"
+      fi
     else
       echo "node-pty: no android-arm64 prebuild in the tarball and none at $NODE_PTY_PREBUILD_SOURCE" >&2
       echo "node-pty: install dsh-termux, or set NODE_PTY_PREBUILD_SOURCE to a pty.node, or set NODE_PTY_PREBUILD_URL" >&2

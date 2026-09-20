@@ -159,84 +159,39 @@ await replaceOnce(
   }
 }
 
-// ---- client-connection: scope the shared RPC registration to webServer (patch 8) ----
-// ATTRIBUTION: [DEFECT] - an upstream self-inconsistency, not plugin compatibility. This patch
-// changes nothing about which plugins are allowed to do what; it makes the host stop aborting on
-// a call the host itself still advertises.
+// ---- client-connection RPC registration: NOT PATCHED (policy) ----
+// User policy (stated twice, verbatim): 不准为插件做兼容 / 不 准 为 插 件 做 兼 容.
 //
-// Upstream 0.1.6-alpha.2 narrowed this module's own inject from ['webServer','credentials'] to
-// ['credentials'] (src/index.ts:84), and moved its own /api route into a scoped
-// ctx.inject(['webServer'], cb) block. That is fine for the module's own code, but the shared
-// plugin-facing register(owner, channel, handler) still does
-// `owner.effect(() => owner.webServer.register(route), ...)` with no inject scope
-// (src/rpc-host.ts:158-179). cordis resolves a service through the fiber chain of the context
-// doing the read, so ANY caller of ctx.connection.handle() throws
-// `cannot get property "webServer" without inject` and the entire profile tree fails to load.
-// Upstream HEAD (d347e70390) still has the wide module inject at src/index.ts:68, i.e. the
-// narrowing landed without the matching scoping fix.
+// What the defect is (still true, and still worth reporting upstream): 0.1.6-alpha.2 narrowed
+// dsh-client-connection's module-level inject from ['webServer','credentials'] to ['credentials']
+// (src/index.ts:84) while the shared plugin-facing register(owner, channel, handler) still reads
+// `owner.webServer` with no inject scope (src/rpc-host.ts:158-179), so any plugin calling
+// ctx.connection.rpc.handle() throws `cannot get property "webServer" without inject` and the
+// whole profile tree fails to load. Upstream HEAD (d347e70390) still carries the wide inject at
+// src/index.ts:68, i.e. the narrowing shipped without the matching scoping fix.
 //
-// Decision rule used here (same three-way rule as patch-session-migration.mjs): a relaxation is
-// [DEFECT] when the value in question appears in upstream's OWN validation/consumption source -
-// i.e. the host contradicts itself. It is [VIOLATION] when the value appears nowhere upstream
-// (a plugin inventing contract). This one is upstream contradicting upstream: the host declares
-// the plugin-facing entry point and then makes it throw.
+// Why this port does not patch it anyway: the trigger, the blast radius and the fix all sit on
+// the plugin path. Patching the host here is plugin compatibility by another name - it would make
+// this port carry a permanent, loudly-anchored edit on the single most volatile file in the
+// release, and it would hide the debt the plugins owe. An earlier revision of this script did
+// patch it (commits 8d87ba3 / 4c26a7d); both are withdrawn.
 //
-// REPRODUCED BOTH WAYS on this machine (2026-09-20, full 0.1.6-alpha.2 tree build/package with
-// all 28 profile bundles carried over, real profile web/, HMR already overridden):
-//   pristine client-connection (sha256 d38d40e5b47a159c...): exit 1, 8x "without inject",
-//     "failed to apply loader entry dsh-pocket" + "failed to apply loader entry dsh-automation",
-//     "dsh: plugin tree failed to load", no "dsh web:" line.
-//   F1 (this patch, sha256 606ba18b8f0d8693...): exit 124 (still alive at 60s), 0 error markers,
-//     "dsh web: http://127.0.0.1:40895/?token=...", dsh-pocket registered its proxy.
-//   F2 (module inject restored, :618 pristine): also boots, 0 error markers - so the choice
-//     between F1 and F2 is semantic, not about whether the host runs.
-// Logs: ~/dsh-upgrade-016a2/evidence/ab-pristine-cc-173445.log, boot-hmr-override-173255.log,
-// ab-f2-fullprofile-173555.log.
+// MEASURED, both ways, on this machine (2026-09-20, full 0.1.6-alpha.2 tree build/package with all
+// 28 profile bundles, real profile web/, HMR already overridden):
+//   pristine client-connection + dsh-pocket/dsh-automation ENABLED:
+//     exit 1, 8x "without inject", "failed to apply loader entry dsh-pocket" and
+//     "failed to apply loader entry dsh-automation", "dsh: plugin tree failed to load".
+//   pristine client-connection + the two entries DISABLED AT THE PROFILE LAYER:
+//     exit 124 (still alive at 50s), 0 error markers, "dsh web: http://127.0.0.1:36573/?token=...".
+//     Log: ~/dsh-upgrade-016a2/evidence/boot-policy-disable-174851.log
 //
-// Why F1 (scope the use site) and not F2 (widen the module inject back):
-//   - F1 keeps upstream's deliberate direction: module inject means "services required BEFORE
-//     providing Connection", and 0.1.6-alpha.2 deliberately stopped gating connection activation
-//     on webServer. F2 would undo that decision.
-//   - F1 is minimal: webServer is read in exactly two places in the package - lib/index.js:618
-//     (this shared registry, the only unscoped one) and :781 (the module's own /api route, already
-//     scoped at :758). registerFetchRoute (:594) and registerInterceptor (:626) never read it.
-//   - F1 is isomorphic to the host's own code, which is the strongest available evidence that it
-//     is the shape upstream would accept.
-//   - Independent corroboration: the third-party fork package @zhengcankai/deepseek-harness
-//     documents this exact defect and describes its fix as wrapping the registration in
-//     ctx.inject(['webServer']) - word for word the same shape as F1.
+// So the policy-compliant shape exists and works: disable the entries at the profile layer, the
+// same treatment ~/.dsh/profiles/web/cordis.patch.yml already gives dsh-seq-injector for the same
+// failure family. No package file is edited for this defect, and the fix belongs upstream.
 //
-// The profile layer CANNOT express this fix: a cordis.patch.yml entry overrides loader-entry
-// options (config/disabled/insert), while `inject` is a module-level export of the package, so no
-// profile override can add it. The only non-package alternative is disabling every entry that
-// registers an RPC channel (dsh-pocket, dsh-automation), which buys a boot by deleting function.
-//
-// This is anchored on the file upstream restructured in this very release, so the anchor is
-// expected to move: the branch below fails loudly rather than silently skipping.
-{
-  const relativePath = "node_modules/@deepseek-ai/dsh-client-connection/lib/index.js";
-  const filename = join(root, relativePath);
-  const source = await readFile(filename, "utf8");
-  const unscoped =
-    "\t\treturn owner.effect(() => owner.webServer.register(route), `client-connection: ${channel} rpc channel`);";
-  const scoped =
-    '\t\treturn owner.inject(["webServer"], (webCtx) => webCtx.effect(() => webCtx.webServer.register(route), `client-connection: ${channel} rpc channel`));';
-  const unscopedCount = source.split(unscoped).length - 1;
-  const scopedCount = source.split(scoped).length - 1;
-  if (unscopedCount === 1) {
-    await writeFile(filename, source.replace(unscoped, scoped));
-    console.log("patched: client-connection: scope the shared RPC registration to webServer");
-  } else if (unscopedCount === 0 && scopedCount === 1) {
-    console.log("skipped: client-connection: shared RPC registration already scoped (upstream, or patch applied)");
-  } else {
-    throw new Error(
-      `client-connection: expected exactly one shared RPC registration in ${relativePath}, found ` +
-        `unscoped=${unscopedCount} scoped=${scopedCount}`,
-    );
-  }
-}
-
-// ═════════════════════════════════════════════════════════════════════════
+// NOTE for whoever revisits this: `inject` is a module-level export, so a cordis.patch.yml entry
+// cannot express the scope fix even if that were wanted - profile entries override loader-entry
+// options (config/disabled/insert) only. The choice is patch-the-package or disable-the-entry.
 
 const { readdir } = await import("node:fs/promises");
 const profileBootMatches = [];

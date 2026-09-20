@@ -129,7 +129,7 @@ node scripts/patch-dsh.mjs "$PACKAGE_DIR"
 # declared dependency closure. Bundles come from the profile manifest rather than a hardcoded list,
 # and anything already in the new package is left alone, so an upstream bump is never silently
 # overridden by a stale copy.
-PROFILE_MANIFEST="${PROFILE_MANIFEST:-$DSH_HOME/profiles/web/package.json}"
+PROFILE_MANIFEST="${PROFILE_MANIFEST:-${DSH_HOME:-$HOME/.dsh}/profiles/web/package.json}"
 # Packages come from more than one place on a real machine: the previous installation's
 # node_modules holds the plugin bundles themselves, while their own dependencies are resolved
 # inside the profile's node_modules. All are searched, in this order.

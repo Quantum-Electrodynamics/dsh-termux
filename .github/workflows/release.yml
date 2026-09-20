@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       upstream_version:
-        description: "Upstream @deepseek-ai/dsh version (blank = auto: highest unbuilt of latest/next)"
+        description: "Upstream @deepseek-ai/dsh version (blank = auto: highest unbuilt of latest/next). Prereleases such as 0.1.6-alpha.2 must be given explicitly - the scheduled path deliberately never picks an alpha tag."
         required: false
         type: string
       force:
@@ -110,17 +110,26 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 24.18.0
-      - name: Install Android NDK
-        uses: android-actions/setup-android@v3
-      - run: sdkmanager "ndk;29.0.14206865"
-      - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
+      # No Android NDK is installed here any more. build-termux-prebuilt.sh assembles the package
+      # from the official koffi Android prebuild plus a pinned node-pty binary, so the
+      # `Install Android NDK` step (android-actions/setup-android@v3) that failed every scheduled
+      # run - and the sdkmanager/cmake/ninja installs it required - are no longer needed.
       - name: Build offline Termux package
         env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/29.0.14206865
+          GH_TOKEN: ${{ github.token }}
           UPSTREAM_VERSION: ${{ needs.check.outputs.upstream }}
           TERMUX_REVISION: ${{ needs.check.outputs.revision }}
-        run: bash scripts/build-termux.sh
+        run: |
+          set -euo pipefail
+          # The runner has no dsh-termux installed to copy the node-pty android-arm64 prebuild
+          # from, so it is taken out of the most recent published release tarball. Its sha256 is
+          # verified inside build-termux-prebuilt.sh before the binary is used.
+          pty_url=""
+          latest_tag="$(gh release list --limit 1 --json tagName --jq '.[0].tagName')"
+          if [[ -n "$latest_tag" ]]; then
+            pty_url="https://github.com/${{ github.repository }}/releases/download/${latest_tag}/dsh-termux.tgz"
+          fi
+          NODE_PTY_PREBUILD_URL="$pty_url" bash scripts/build-termux-prebuilt.sh
       - uses: actions/upload-artifact@v4
         with:
           name: dsh-termux-${{ needs.check.outputs.termux }}

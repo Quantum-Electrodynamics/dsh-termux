@@ -3,26 +3,66 @@
 import { access, readFile, readdir as readdirAsync } from "node:fs/promises";
 import { readdirSync } from "node:fs";
 import { join } from "node:path";
+import { inspectElf } from "./native-elf.mjs";
 
 const [root, expectedVersion] = process.argv.slice(2);
 if (!root || !expectedVersion) {
   throw new Error("usage: verify-package.mjs <package-directory> <expected-version>");
 }
 
+// The official koffi Android prebuild is compiled against android-28 (Android 9), so this port
+// now requires API 28+ where the old source build was compiled against android-24. The ceiling is
+// asserted rather than assumed: if a future koffi prebuild raises it, the build fails here instead
+// of shipping a package that cannot load on the devices this port claims to support.
+const ANDROID_DEVICE_API_CEILING = 28;
+
 const manifest = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
 if (manifest.name !== "dsh-termux" || manifest.version !== expectedVersion) {
   throw new Error(`unexpected package identity ${manifest.name}@${manifest.version}`);
 }
 
+// koffi ships an official Android arm64 prebuild (@koromix/koffi-android-arm64) since 3.3.1,
+// which is used as-is; older koffi versions are compiled from source by build-termux.sh.
+// Accept either layout.
+const koffiBinary = [
+  "node_modules/@koromix/koffi-android-arm64/android_arm64/koffi.node",
+  "node_modules/koffi/build/koffi/android_arm64/koffi.node",
+];
 const required = [
   "lib/bin.js",
   "node_modules/node-pty/prebuilds/android-arm64/pty.node",
-  "node_modules/koffi/build/koffi/android_arm64/koffi.node",
   "node_modules/@esbuild/android-arm64/bin/esbuild",
   "node_modules/@img/sharp-wasm32/lib",
 ];
 for (const relativePath of required) {
   await access(join(root, relativePath));
+}
+let koffiFound = null;
+for (const candidate of koffiBinary) {
+  try {
+    await access(join(root, candidate));
+    koffiFound = candidate;
+    break;
+  } catch {}
+}
+if (koffiFound === null) {
+  throw new Error(`no koffi Android arm64 binary found; looked for:\n  ${koffiBinary.join("\n  ")}`);
+}
+
+// The `file ... | grep "ARM aarch64"` checks in build-termux.sh cannot run here (the Termux image
+// has no `file`), and they never checked the Android API level at all. Both are checked directly,
+// because a wrong-architecture or too-new binary packs fine and only fails on the user's device.
+const nativeBinaries = [
+  join(root, koffiFound),
+  join(root, "node_modules/node-pty/prebuilds/android-arm64/pty.node"),
+];
+for (const binary of nativeBinaries) {
+  const { apiLevel } = inspectElf(binary);
+  if (apiLevel !== null && apiLevel > ANDROID_DEVICE_API_CEILING) {
+    throw new Error(
+      `${binary.slice(root.length + 1)} requires android api ${apiLevel}, above the supported ceiling ${ANDROID_DEVICE_API_CEILING}`,
+    );
+  }
 }
 
 const profileFiles = [];
@@ -31,13 +71,30 @@ for (const name of await readdirAsync(join(root, "lib"))) {
   const source = await readFile(join(root, "lib", name), "utf8");
   if (source.includes("watchUserPatches(ctx")) profileFiles.push(name);
 }
-if (profileFiles.length !== 1) throw new Error(`expected one profile-boot implementation, found ${profileFiles.length}`);
+// Upstream <= 0.1.5-rc.2 has exactly one profile-boot chunk that boots the HMR watcher, which the
+// HMR guard patch rewrites. Upstream >= 0.1.6-alpha.2 removed watchUserPatches and loads patch files
+// once at boot via readProfilePatches(), so the patch is a no-op skip. Require that the modern entry
+// point really is present, so a future refactor cannot pass verification unpatched.
+if (profileFiles.length > 1) throw new Error(`expected at most one profile-boot implementation, found ${profileFiles.length}`);
+if (profileFiles.length === 0) {
+  let modernLoader = false;
+  for (const name of await readdirAsync(join(root, "lib"))) {
+    if (!/^profile-boot-.*\.js$/.test(name)) continue;
+    const source = await readFile(join(root, "lib", name), "utf8");
+    if (source.includes("readProfilePatches(")) modernLoader = true;
+  }
+  if (!modernLoader) {
+    throw new Error("no profile-boot patch-loading entry point found (neither watchUserPatches nor readProfilePatches)");
+  }
+}
 
 const checks = [
   [join("node_modules", "koffi", "lib", "native", "base", "base.cc"), "defined(__ANDROID__)"],
   [join("node_modules", "koffi", "lib", "native", "base", "base.cc"), "__ANDROID_API__ < 28"],
   [join("node_modules", "koffi", "src", "koffi", "CMakeLists.txt"), "--unresolved-symbols=ignore-all"],
-  [join("lib", profileFiles[0]), "process.execArgv.includes(\"--expose-internals\")"],
+  ...(profileFiles.length === 1
+    ? [[join("lib", profileFiles[0]), "process.execArgv.includes(\"--expose-internals\")"]]
+    : []),
   [join("node_modules", "@deepseek-ai", "dsh-session-persistence-jsonl", "lib", "index.js"), "process.platform === \"android\""],
 ];
 for (const [relativePath, needle] of checks) {

@@ -1,0 +1,7 @@
+# Build outputs. scripts/build-termux.sh and scripts/build-termux-prebuilt.sh both write a
+# throwaway npm tree into ./build and the packed tarball into ./dist. Neither is source: the
+# release workflow uploads dist/* as a build artifact and publishes the tarball itself, so keeping
+# them out of the repository avoids committing a ~150 MB binary and a 600 MB dependency tree.
+build/
+dist/
+node_modules/

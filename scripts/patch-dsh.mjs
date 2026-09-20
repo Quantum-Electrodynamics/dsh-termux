@@ -92,6 +92,60 @@ await replaceOnce(
   "koffi: resolve Node-API symbols at module load time on Android",
 );
 
+// ---- profile resolution mode (Android: no node-addon-require-builtin prebuild) ----
+// Upstream 0.1.6 defaults the profile module-resolution mode to "runtime", which installs a
+// generation on Node's own ESM/CommonJS resolvers through the `node-addon-require-builtin`
+// native addon (dsh-app-boot internalModules()). That addon publishes prebuilds for darwin,
+// linux and win32 only — there is no android-arm64 package — so on Android the addon cannot be
+// loaded and dsh aborts at "host preparation failed".
+//
+// "link" mode instead maintains $DSH_HOME/profiles/node_modules symlinks via
+// healProfilesModuleFallback(), the same module-fallback mechanism this Termux port already
+// relies on, and PluginPackages then receives no generation, so the native addon is never
+// required. Pin the mode explicitly rather than leaving it to the "runtime" default.
+await replaceOnce(
+  "lib/bin.js",
+  `\t\t\t\t\tpatchFiles: invocation.patches,
+\t\t\t\t\targs: invocation.args
+\t\t\t\t});`,
+  `\t\t\t\t\tpatchFiles: invocation.patches,
+\t\t\t\t\targs: invocation.args,
+\t\t\t\t\tresolutionMode: "link"
+\t\t\t\t});`,
+  "dsh: use link profile resolution (no node-addon-require-builtin prebuild on Android)",
+);
+
+// ---- HMR service guard (patch 7) ----
+// Cordis HMR requires Node's --expose-internals, which cannot be passed through NODE_OPTIONS.
+// Upstream <= 0.1.5-rc.2 booted the HMR watcher from the launcher (profile-boot), which this
+// port rewrote to only create it under --expose-internals. Upstream 0.1.6-alpha.2 moved HMR into
+// a normal loader entry declared by the @deepseek-ai/dsh-base bundle patch, whose Hmr constructor
+// throws "--expose-internals is required for HMR service" when ctx.loader.internal is absent.
+// The entry's `disabled` expression is therefore extended with the same guard, so the entry
+// stays inert unless Node was actually started with the flag.
+//
+// Verified against the real upstream tree: the guard must be present exactly once, so a future
+// upstream change to the entry shape fails the build instead of shipping a host that cannot boot.
+{
+  const filename = join(root, "node_modules/@deepseek-ai/dsh-base/cordis.patch.yml");
+  const source = await readFile(filename, "utf8");
+  const pattern = /(- id: hmr\n\s+name: '@deepseek-ai\/dsh-hmr'\n\s+disabled: )!!js "([^"]*)"/;
+  const match = source.match(pattern);
+  if (match === null) {
+    throw new Error("dsh HMR guard: no hmr entry with a disabled expression in @deepseek-ai/dsh-base/cordis.patch.yml");
+  }
+  const guard = "process.execArgv.includes('--expose-internals')";
+  if (match[2].includes(guard)) {
+    console.log("skipped: dsh HMR guard: already applied");
+  } else {
+    await writeFile(
+      filename,
+      source.replace(pattern, `$1!!js "(${match[2]}) || !${guard}"`),
+    );
+    console.log("patched: dsh: disable the hmr entry without --expose-internals");
+  }
+}
+
 const { readdir } = await import("node:fs/promises");
 const profileBootMatches = [];
 for (const name of await readdir(join(root, "lib"))) {
@@ -99,13 +153,40 @@ for (const name of await readdir(join(root, "lib"))) {
   const source = await readFile(join(root, "lib", name), "utf8");
   if (source.includes("watchUserPatches(ctx")) profileBootMatches.push(join("lib", name));
 }
-if (profileBootMatches.length !== 1) {
-  throw new Error(`dsh HMR patch: expected one implementation chunk, found ${profileBootMatches.length}`);
+// Upstream <= 0.1.5-rc.2 boots the cordis-plugin-hmr watcher unconditionally and installs
+// patch-file watchers via watchUserPatches(). Cordis HMR requires Node's --expose-internals,
+// which cannot be passed through NODE_OPTIONS, so the launcher must not create that watcher
+// unless the flag was given explicitly.
+//
+// Upstream 0.1.6-alpha.2 removed watchUserPatches entirely and loads patch files once at boot
+// via readProfilePatches()/loadOverlayPatches(), so there is no unconditional HMR watcher left
+// to guard. That is a legitimate upstream fix of the same defect, not a refactor that would
+// silently lose the patch. The branch below distinguishes the two cases and only skips when the
+// modern one-shot patch-loading entry point is actually present, so a future upstream change of
+// that entry point still fails loudly instead of shipping unpatched.
+if (profileBootMatches.length > 1) {
+  throw new Error(`dsh HMR patch: expected at most one implementation chunk, found ${profileBootMatches.length}`);
+}
+if (profileBootMatches.length === 0) {
+  let modernLoader = false;
+  for (const name of await readdir(join(root, "lib"))) {
+    if (!/^profile-boot-.*\.js$/.test(name)) continue;
+    const source = await readFile(join(root, "lib", name), "utf8");
+    if (source.includes("readProfilePatches(")) modernLoader = true;
+  }
+  if (!modernLoader) {
+    throw new Error(
+      "dsh HMR patch: neither watchUserPatches() nor readProfilePatches() found in any profile-boot chunk; " +
+        "upstream changed its patch-loading entry point and this guard must be re-reviewed",
+    );
+  }
+  console.log("skipped: dsh HMR guard: upstream loads patch files once at boot (no unconditional HMR watcher to guard)");
 }
 const [profileBoot] = profileBootMatches;
 
-await replaceOnce(
-  profileBoot,
+if (profileBoot !== undefined)
+  await replaceOnce(
+    profileBoot,
   `\t\tif (ctx.get("hmr") === void 0) {
 \t\t\tif (ctx.get("timer") === void 0) await ctx.loader.create({ name: "@deepseek-ai/cordis-plugin-timer" });
 \t\t\tawait ctx.loader.create({
@@ -143,14 +224,28 @@ await replaceOnce(
 			});
 		}`,
   "dsh: skip patch-file HMR without --expose-internals",
-);
+  );
 
-await replaceOnce(
-  "node_modules/@deepseek-ai/dsh-session-persistence-jsonl/lib/index.js",
-  "import { link, mkdir, mkdtemp, open, readFile, readdir, realpath, rm, stat, truncate } from \"node:fs/promises\";",
-  "import { link, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, stat, truncate } from \"node:fs/promises\";",
-  "session persistence: import rename",
-);
+// The fs/promises import list is not stable across upstream releases: 0.1.6-alpha.2 added lstat
+// and dropped rename. Insert `rename` into whatever the list actually is instead of pinning it,
+// so the patch keeps working across upstream releases and still fails if the import disappears.
+{
+  const filename = join(root, "node_modules/@deepseek-ai/dsh-session-persistence-jsonl/lib/index.js");
+  const source = await readFile(filename, "utf8");
+  const match = source.match(/import \{ ([^}]*?) \} from "node:fs\/promises";/);
+  if (match === null) {
+    throw new Error("session persistence: no node:fs/promises import found");
+  }
+  const names = match[1].split(",").map((part) => part.trim());
+  if (names.includes("rename")) {
+    console.log("skipped: session persistence: rename already imported");
+  } else {
+    names.push("rename");
+    names.sort();
+    await writeFile(filename, source.replace(match[0], `import { ${names.join(", ")} } from "node:fs/promises";`));
+    console.log("patched: session persistence: import rename");
+  }
+}
 
 await replaceOnce(
   "node_modules/@deepseek-ai/dsh-session-persistence-jsonl/lib/index.js",

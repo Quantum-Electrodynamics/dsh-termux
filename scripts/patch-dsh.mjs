@@ -146,6 +146,52 @@ await replaceOnce(
   }
 }
 
+// ---- client-connection: restore the webServer inject (patch 8) ----
+// Upstream 0.1.6-alpha.2 narrowed this module's own inject from ['webServer','credentials'] to
+// ['credentials'], and moved its own /api route into a scoped ctx.inject(['webServer'], cb) block.
+// That refactor is fine for the plugin's own code, but the shared plugin-facing
+// register(owner, channel, handler) still does
+// `owner.effect(() => owner.webServer.register(route), ...)` - and that closure runs inside THIS
+// module's fiber. With webServer gone from the module inject, cordis throws
+// `cannot get property "webServer" without inject` for any plugin that registers an RPC channel
+// through ctx.connection.handle(), so the entire profile tree fails to load.
+//
+// Observed first-hand on a real 0.1.6-alpha.2 tree: dsh-pocket.apply ->
+// installPocketRpc (dsh-pocket/lib/web-rpc.js:39) -> ctx.connection.handle() -> ... -> throw at
+// dsh-client-connection/lib/index.js:618. connection never reached ACTIVE, so 7 dependent entries
+// stayed PENDING and the host aborted. dsh-pocket is byte-identical to the 0.1.2 tree and declares
+// inject ['connection','webServer'] correctly, so the defect is here, not in the plugin.
+//
+// Restoring the inject is the minimal correct fix rather than a workaround: the comment above the
+// declaration still says these are the "Services required before providing Connection", and the
+// module header says the webServer entry "Activates the webServer Context merge used below" - it is
+// load-bearing. Upstream HEAD (d347e70390, dsh-0.1.3-alpha.1 era) also still declares
+// ['webServer','credentials'], so 0.1.6-alpha.2 is a branch regression, not a new direction.
+//
+// The published package's compiled lib/ is patched because this port consumes the npm package, not
+// the upstream monorepo; the same edit is what a source build carries in
+// packages/client/connection/src/index.ts.
+{
+  const relativePath = "node_modules/@deepseek-ai/dsh-client-connection/lib/index.js";
+  const filename = join(root, relativePath);
+  const source = await readFile(filename, "utf8");
+  const narrowed = `const inject = ["credentials"];`;
+  const restored = `const inject = ["webServer", "credentials"];`;
+  const narrowedCount = source.split(narrowed).length - 1;
+  const restoredCount = source.split(restored).length - 1;
+  if (narrowedCount === 1) {
+    await writeFile(filename, source.replace(narrowed, restored));
+    console.log("patched: client-connection: restore the webServer inject that 0.1.6 narrowed away");
+  } else if (narrowedCount === 0 && restoredCount === 1) {
+    console.log("skipped: client-connection: webServer inject already declared (upstream, or patch applied)");
+  } else {
+    throw new Error(
+      `client-connection: expected exactly one inject declaration in ${relativePath}, found ` +
+        `narrowed=${narrowedCount} restored=${restoredCount}`,
+    );
+  }
+}
+
 const { readdir } = await import("node:fs/promises");
 const profileBootMatches = [];
 for (const name of await readdir(join(root, "lib"))) {

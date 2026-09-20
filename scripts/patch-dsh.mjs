@@ -146,15 +146,15 @@ await replaceOnce(
   }
 }
 
-// ---- client-connection: restore the webServer inject (patch 8) ----
+// ---- client-connection: scope the shared RPC registration to webServer (patch 8) ----
 // Upstream 0.1.6-alpha.2 narrowed this module's own inject from ['webServer','credentials'] to
 // ['credentials'], and moved its own /api route into a scoped ctx.inject(['webServer'], cb) block.
-// That refactor is fine for the plugin's own code, but the shared plugin-facing
+// That is fine for the module's own code, but the shared plugin-facing
 // register(owner, channel, handler) still does
-// `owner.effect(() => owner.webServer.register(route), ...)` - and that closure runs inside THIS
-// module's fiber. With webServer gone from the module inject, cordis throws
-// `cannot get property "webServer" without inject` for any plugin that registers an RPC channel
-// through ctx.connection.handle(), so the entire profile tree fails to load.
+// `owner.effect(() => owner.webServer.register(route), ...)` with no inject scope. cordis only
+// resolves a service through the fiber chain of the context doing the read, so any plugin that
+// registers an RPC channel through ctx.connection.handle() throws
+// `cannot get property "webServer" without inject` and the entire profile tree fails to load.
 //
 // Observed first-hand on a real 0.1.6-alpha.2 tree: dsh-pocket.apply ->
 // installPocketRpc (dsh-pocket/lib/web-rpc.js:39) -> ctx.connection.handle() -> ... -> throw at
@@ -162,11 +162,21 @@ await replaceOnce(
 // stayed PENDING and the host aborted. dsh-pocket is byte-identical to the 0.1.2 tree and declares
 // inject ['connection','webServer'] correctly, so the defect is here, not in the plugin.
 //
-// Restoring the inject is the minimal correct fix rather than a workaround: the comment above the
-// declaration still says these are the "Services required before providing Connection", and the
-// module header says the webServer entry "Activates the webServer Context merge used below" - it is
-// load-bearing. Upstream HEAD (d347e70390, dsh-0.1.3-alpha.1 era) also still declares
-// ['webServer','credentials'], so 0.1.6-alpha.2 is a branch regression, not a new direction.
+// The fix wraps the registration in ctx.inject(['webServer'], cb) - exactly the shape the module
+// already uses for its own /api route (lib/index.js:758 + :781). Two narrower alternatives were
+// considered and rejected:
+//
+//   - Restoring the module-level inject to ['webServer','credentials'] (what this patch did before)
+//     also boots, but it reverts an intentional upstream decision: module inject means "services
+//     required BEFORE providing Connection", and 0.1.6-alpha.2 deliberately stopped gating
+//     connection activation on webServer. The header comment that used to justify the old
+//     declaration ("Activates the webServer Context merge used below") is already stale in
+//     alpha2 - it survives in src/index.ts but is gone from the compiled lib/ - so it is not
+//     load-bearing any more. This patch must not undo an upstream direction.
+//   - webServer is read in exactly two places in the whole package: lib/index.js:618 (this shared
+//     registry, the only unscoped one) and :781 (the module's own /api route, already scoped). The
+//     sibling registries registerFetchRoute (:594) and registerInterceptor (:626) never touch
+//     webServer, so there is no second latent site to fix.
 //
 // The published package's compiled lib/ is patched because this port consumes the npm package, not
 // the upstream monorepo; the same edit is what a source build carries in
@@ -175,19 +185,21 @@ await replaceOnce(
   const relativePath = "node_modules/@deepseek-ai/dsh-client-connection/lib/index.js";
   const filename = join(root, relativePath);
   const source = await readFile(filename, "utf8");
-  const narrowed = `const inject = ["credentials"];`;
-  const restored = `const inject = ["webServer", "credentials"];`;
-  const narrowedCount = source.split(narrowed).length - 1;
-  const restoredCount = source.split(restored).length - 1;
-  if (narrowedCount === 1) {
-    await writeFile(filename, source.replace(narrowed, restored));
-    console.log("patched: client-connection: restore the webServer inject that 0.1.6 narrowed away");
-  } else if (narrowedCount === 0 && restoredCount === 1) {
-    console.log("skipped: client-connection: webServer inject already declared (upstream, or patch applied)");
+  const unscoped =
+    "\t\treturn owner.effect(() => owner.webServer.register(route), `client-connection: ${channel} rpc channel`);";
+  const scoped =
+    '\t\treturn owner.inject(["webServer"], (webCtx) => webCtx.effect(() => webCtx.webServer.register(route), `client-connection: ${channel} rpc channel`));';
+  const unscopedCount = source.split(unscoped).length - 1;
+  const scopedCount = source.split(scoped).length - 1;
+  if (unscopedCount === 1) {
+    await writeFile(filename, source.replace(unscoped, scoped));
+    console.log("patched: client-connection: scope the shared RPC registration to webServer");
+  } else if (unscopedCount === 0 && scopedCount === 1) {
+    console.log("skipped: client-connection: shared RPC registration already scoped (upstream, or patch applied)");
   } else {
     throw new Error(
-      `client-connection: expected exactly one inject declaration in ${relativePath}, found ` +
-        `narrowed=${narrowedCount} restored=${restoredCount}`,
+      `client-connection: expected exactly one shared RPC registration in ${relativePath}, found ` +
+        `unscoped=${unscopedCount} scoped=${scopedCount}`,
     );
   }
 }

@@ -88,6 +88,25 @@ if (profileFiles.length === 0) {
   }
 }
 
+// Upstream <= 0.1.5-rc.2 boots the HMR watcher from a profile-boot chunk that this port rewrites
+// (guard marker expected there). Upstream >= 0.1.6-alpha.2 moved HMR into a loader entry owned by
+// the @deepseek-ai/dsh-base bundle patch; this port no longer edits that YAML - the guard is a
+// same-id override in the profile's own cordis.patch.yml. So instead of a HMR marker in the
+// package, verify the thing the override depends on: that an `id: hmr` row still exists to
+// override. If upstream renames or removes it, the override becomes a silent no-op - fail here.
+let hmrOverrideTargetPresent = true;
+{
+  const dshBasePatch = join(root, "node_modules", "@deepseek-ai", "dsh-base", "cordis.patch.yml");
+  let source;
+  try {
+    source = await readFile(dshBasePatch, "utf8");
+  } catch {
+    hmrOverrideTargetPresent = false;
+    source = "";
+  }
+  if (hmrOverrideTargetPresent && !/-\s+id:\s*hmr\b/.test(source)) hmrOverrideTargetPresent = false;
+}
+
 const checks = [
   [join("node_modules", "koffi", "lib", "native", "base", "base.cc"), "defined(__ANDROID__)"],
   [join("node_modules", "koffi", "lib", "native", "base", "base.cc"), "__ANDROID_API__ < 28"],
@@ -100,6 +119,12 @@ const checks = [
 for (const [relativePath, needle] of checks) {
   const source = await readFile(join(root, relativePath), "utf8");
   if (!source.includes(needle)) throw new Error(`missing patch marker in ${relativePath}`);
+}
+if (!hmrOverrideTargetPresent) {
+  throw new Error(
+    "no `id: hmr` row in node_modules/@deepseek-ai/dsh-base/cordis.patch.yml: the profile-level HMR " +
+      "override would be a silent no-op. Re-derive the HMR guard before shipping this build.",
+  );
 }
 
 // ---- closure integrity gate ----

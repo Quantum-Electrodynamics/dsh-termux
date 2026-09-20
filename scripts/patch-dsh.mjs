@@ -115,72 +115,104 @@ await replaceOnce(
   "dsh: use link profile resolution (no node-addon-require-builtin prebuild on Android)",
 );
 
-// ---- HMR service guard (patch 7) ----
+// ---- HMR entry guard: verified, NOT patched (profile override instead) ----
 // Cordis HMR requires Node's --expose-internals, which cannot be passed through NODE_OPTIONS.
 // Upstream <= 0.1.5-rc.2 booted the HMR watcher from the launcher (profile-boot), which this
 // port rewrote to only create it under --expose-internals. Upstream 0.1.6-alpha.2 moved HMR into
 // a normal loader entry declared by the @deepseek-ai/dsh-base bundle patch, whose Hmr constructor
 // throws "--expose-internals is required for HMR service" when ctx.loader.internal is absent.
-// The entry's `disabled` expression is therefore extended with the same guard, so the entry
-// stays inert unless Node was actually started with the flag.
 //
-// Verified against the real upstream tree: the guard must be present exactly once, so a future
-// upstream change to the entry shape fails the build instead of shipping a host that cannot boot.
+// This used to be patched by rewriting the entry's `disabled` expression inside
+// node_modules/@deepseek-ai/dsh-base/cordis.patch.yml. That is the wrong layer: it edits a
+// shipped package's YAML with a text regex, so any upstream rewording of the entry (whitespace,
+// quote style, field order) breaks the anchor, and the edit is invisible to `dsh --profile`.
+//
+// The loader applies the profile's own cordis.patch.yml AFTER every bundle layer, so the same
+// effect is reachable as a same-id override row the user owns:
+//
+//   - id: hmr
+//     disabled: true
+//
+// Consequences the user must accept for that override: in-process HMR is off for this profile.
+// Nothing else changes - no tool, no schema, no prompt.
+//
+// What this block still does: verify an `id: hmr` row exists to override (so the override is not
+// a silent no-op) and print the exact row. It writes nothing.
 {
   const filename = join(root, "node_modules/@deepseek-ai/dsh-base/cordis.patch.yml");
   const source = await readFile(filename, "utf8");
-  const pattern = /(- id: hmr\n\s+name: '@deepseek-ai\/dsh-hmr'\n\s+disabled: )!!js "([^"]*)"/;
-  const match = source.match(pattern);
-  if (match === null) {
-    throw new Error("dsh HMR guard: no hmr entry with a disabled expression in @deepseek-ai/dsh-base/cordis.patch.yml");
-  }
-  const guard = "process.execArgv.includes('--expose-internals')";
-  if (match[2].includes(guard)) {
-    console.log("skipped: dsh HMR guard: already applied");
-  } else {
-    await writeFile(
-      filename,
-      source.replace(pattern, `$1!!js "(${match[2]}) || !${guard}"`),
+  // Tolerant of whitespace/quote style: we only need to know the row exists and has a disabled field.
+  const hasHmrRow = /-\s+id:\s*hmr\b/.test(source);
+  if (!hasHmrRow) {
+    throw new Error(
+      "dsh HMR guard: @deepseek-ai/dsh-base/cordis.patch.yml has no `id: hmr` row, so a profile " +
+        "override would be a silent no-op. Upstream moved or removed the entry - re-derive the " +
+        "guard before shipping a host that cannot boot without --expose-internals.",
     );
-    console.log("patched: dsh: disable the hmr entry without --expose-internals");
+  }
+  if (/-\s+id:\s*hmr\b[\s\S]{0,200}?disabled:\s*true/.test(source)) {
+    console.log("ok: dsh HMR entry is already statically disabled upstream - no override needed");
+  } else {
+    console.log("action required: add this row to the profile's cordis.patch.yml (same-id override):");
+    console.log("    - id: hmr");
+    console.log("      disabled: true");
   }
 }
 
 // ---- client-connection: scope the shared RPC registration to webServer (patch 8) ----
+// ATTRIBUTION: [DEFECT] - an upstream self-inconsistency, not plugin compatibility. This patch
+// changes nothing about which plugins are allowed to do what; it makes the host stop aborting on
+// a call the host itself still advertises.
+//
 // Upstream 0.1.6-alpha.2 narrowed this module's own inject from ['webServer','credentials'] to
-// ['credentials'], and moved its own /api route into a scoped ctx.inject(['webServer'], cb) block.
-// That is fine for the module's own code, but the shared plugin-facing
-// register(owner, channel, handler) still does
-// `owner.effect(() => owner.webServer.register(route), ...)` with no inject scope. cordis only
-// resolves a service through the fiber chain of the context doing the read, so any plugin that
-// registers an RPC channel through ctx.connection.handle() throws
+// ['credentials'] (src/index.ts:84), and moved its own /api route into a scoped
+// ctx.inject(['webServer'], cb) block. That is fine for the module's own code, but the shared
+// plugin-facing register(owner, channel, handler) still does
+// `owner.effect(() => owner.webServer.register(route), ...)` with no inject scope
+// (src/rpc-host.ts:158-179). cordis resolves a service through the fiber chain of the context
+// doing the read, so ANY caller of ctx.connection.handle() throws
 // `cannot get property "webServer" without inject` and the entire profile tree fails to load.
+// Upstream HEAD (d347e70390) still has the wide module inject at src/index.ts:68, i.e. the
+// narrowing landed without the matching scoping fix.
 //
-// Observed first-hand on a real 0.1.6-alpha.2 tree: dsh-pocket.apply ->
-// installPocketRpc (dsh-pocket/lib/web-rpc.js:39) -> ctx.connection.handle() -> ... -> throw at
-// dsh-client-connection/lib/index.js:618. connection never reached ACTIVE, so 7 dependent entries
-// stayed PENDING and the host aborted. dsh-pocket is byte-identical to the 0.1.2 tree and declares
-// inject ['connection','webServer'] correctly, so the defect is here, not in the plugin.
+// Decision rule used here (same three-way rule as patch-session-migration.mjs): a relaxation is
+// [DEFECT] when the value in question appears in upstream's OWN validation/consumption source -
+// i.e. the host contradicts itself. It is [VIOLATION] when the value appears nowhere upstream
+// (a plugin inventing contract). This one is upstream contradicting upstream: the host declares
+// the plugin-facing entry point and then makes it throw.
 //
-// The fix wraps the registration in ctx.inject(['webServer'], cb) - exactly the shape the module
-// already uses for its own /api route (lib/index.js:758 + :781). Two narrower alternatives were
-// considered and rejected:
+// REPRODUCED BOTH WAYS on this machine (2026-09-20, full 0.1.6-alpha.2 tree build/package with
+// all 28 profile bundles carried over, real profile web/, HMR already overridden):
+//   pristine client-connection (sha256 d38d40e5b47a159c...): exit 1, 8x "without inject",
+//     "failed to apply loader entry dsh-pocket" + "failed to apply loader entry dsh-automation",
+//     "dsh: plugin tree failed to load", no "dsh web:" line.
+//   F1 (this patch, sha256 606ba18b8f0d8693...): exit 124 (still alive at 60s), 0 error markers,
+//     "dsh web: http://127.0.0.1:40895/?token=...", dsh-pocket registered its proxy.
+//   F2 (module inject restored, :618 pristine): also boots, 0 error markers - so the choice
+//     between F1 and F2 is semantic, not about whether the host runs.
+// Logs: ~/dsh-upgrade-016a2/evidence/ab-pristine-cc-173445.log, boot-hmr-override-173255.log,
+// ab-f2-fullprofile-173555.log.
 //
-//   - Restoring the module-level inject to ['webServer','credentials'] (what this patch did before)
-//     also boots, but it reverts an intentional upstream decision: module inject means "services
-//     required BEFORE providing Connection", and 0.1.6-alpha.2 deliberately stopped gating
-//     connection activation on webServer. The header comment that used to justify the old
-//     declaration ("Activates the webServer Context merge used below") is already stale in
-//     alpha2 - it survives in src/index.ts but is gone from the compiled lib/ - so it is not
-//     load-bearing any more. This patch must not undo an upstream direction.
-//   - webServer is read in exactly two places in the whole package: lib/index.js:618 (this shared
-//     registry, the only unscoped one) and :781 (the module's own /api route, already scoped). The
-//     sibling registries registerFetchRoute (:594) and registerInterceptor (:626) never touch
-//     webServer, so there is no second latent site to fix.
+// Why F1 (scope the use site) and not F2 (widen the module inject back):
+//   - F1 keeps upstream's deliberate direction: module inject means "services required BEFORE
+//     providing Connection", and 0.1.6-alpha.2 deliberately stopped gating connection activation
+//     on webServer. F2 would undo that decision.
+//   - F1 is minimal: webServer is read in exactly two places in the package - lib/index.js:618
+//     (this shared registry, the only unscoped one) and :781 (the module's own /api route, already
+//     scoped at :758). registerFetchRoute (:594) and registerInterceptor (:626) never read it.
+//   - F1 is isomorphic to the host's own code, which is the strongest available evidence that it
+//     is the shape upstream would accept.
+//   - Independent corroboration: the third-party fork package @zhengcankai/deepseek-harness
+//     documents this exact defect and describes its fix as wrapping the registration in
+//     ctx.inject(['webServer']) - word for word the same shape as F1.
 //
-// The published package's compiled lib/ is patched because this port consumes the npm package, not
-// the upstream monorepo; the same edit is what a source build carries in
-// packages/client/connection/src/index.ts.
+// The profile layer CANNOT express this fix: a cordis.patch.yml entry overrides loader-entry
+// options (config/disabled/insert), while `inject` is a module-level export of the package, so no
+// profile override can add it. The only non-package alternative is disabling every entry that
+// registers an RPC channel (dsh-pocket, dsh-automation), which buys a boot by deleting function.
+//
+// This is anchored on the file upstream restructured in this very release, so the anchor is
+// expected to move: the branch below fails loudly rather than silently skipping.
 {
   const relativePath = "node_modules/@deepseek-ai/dsh-client-connection/lib/index.js";
   const filename = join(root, relativePath);
@@ -203,6 +235,8 @@ await replaceOnce(
     );
   }
 }
+
+// ═════════════════════════════════════════════════════════════════════════
 
 const { readdir } = await import("node:fs/promises");
 const profileBootMatches = [];

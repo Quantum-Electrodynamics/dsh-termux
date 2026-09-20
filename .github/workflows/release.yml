@@ -151,10 +151,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "v${{ needs.check.outputs.termux }}" \
-            "dist/dsh-termux-${{ needs.check.outputs.termux }}.tgz" \
-            "dist/dsh-termux-${{ needs.check.outputs.termux }}.tgz.sha256" \
+          version="${{ needs.check.outputs.termux }}"
+          # A prerelease must never take over the stable `latest` pointer: publishing
+          # 0.1.6-alpha.2 with --latest would point users of the plain `latest` tag at an
+          # alpha build. Prereleases therefore pass --prerelease and NOT --latest; only
+          # stable versions pass --latest.
+          case "$version" in
+            *-alpha.*|*-beta.*|*-rc.*) flags=(--prerelease) ;;
+            *) flags=(--latest) ;;
+          esac
+          gh release create "v$version" \
+            "dist/dsh-termux-$version.tgz" \
+            "dist/dsh-termux-$version.tgz.sha256" \
             "dist/dsh-termux.tgz" \
-            --title "dsh-termux ${{ needs.check.outputs.termux }}" \
+            --title "dsh-termux $version" \
             --notes-file release-notes.md \
-            --latest
+            "${flags[@]}"

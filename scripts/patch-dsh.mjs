@@ -300,3 +300,59 @@ await replaceOnce(
   "\t\t\tif (process.platform === \"android\") await rename(tmp, finalPath);\n\t\t\telse await link(tmp, finalPath);",
   "session persistence: publish with rename on Android",
 );
+
+// ---- flock: Termux android has no node-addon-system platform prebuild ----
+// dsh-session-persistence-jsonl takes an exclusive flock(2) on session.lock through
+// @deepseek-ai/node-addon-system/flock. That entry only accepts platform 'linux'/'darwin'
+// and resolves the addon from `@deepseek-ai/node-addon-system-<platform>-<arch>`; on Termux
+// process.platform === "android", so it throws "flock is not supported on android-arm64"
+// the first time a session write takes the lock. Upstream 0.1.6 still has this (thread:
+// https://github.com/deepseek-ai/deepseek-harness/discussions/6148).
+//
+// Android is a Linux userland with flock(2) in bionic; what is missing is only the
+// android-arm64 binding package. This port therefore routes the platform gate on android
+// to a binding implemented over koffi - which is already a hard dependency of
+// dsh-session-persistence-jsonl (^3.1.0) and ships android-arm64 prebuilds in the tree -
+// calling libc's flock() with the same LOCK_EX|LOCK_NB semantics as the native addon.
+// Shape borrowed from zexadev/dsh-tether scripts/android-flock-shim.mjs (deployed in
+// production); errno convention kept: callback receives 0 for success or a POSITIVE errno,
+// the caller negates it before getSystemErrorName().
+{
+  const filename = join(root, "node_modules/@deepseek-ai/node-addon-system/lib/flock.js");
+  const source = await readFile(filename, "utf8");
+  const anchor = "    if (platform !== 'linux' && platform !== 'darwin') {";
+  const hits = source.split(anchor).length - 1;
+  if (hits !== 1) {
+    throw new Error(
+      `flock: expected exactly one platform gate in node_modules/@deepseek-ai/node-addon-system/lib/flock.js, found ${hits} - re-review`,
+    );
+  }
+  if (source.includes("__tetherAndroidFlock")) {
+    console.log("skipped: flock: android koffi binding already injected");
+  } else {
+    const prelude = `let __flockAndroidBinding;
+/** Termux/android has no node-addon-system binding; use koffi (already a dependency) -> libc flock(2). */
+function __tetherAndroidFlock() {
+    if (__flockAndroidBinding)
+        return __flockAndroidBinding;
+    const koffi = createRequire(import.meta.url)('koffi');
+    const flock = koffi.load('libc.so').func('int flock(int fd, int operation)');
+    __flockAndroidBinding = {
+        tryLock(fd, callback) {
+            // LOCK_EX | LOCK_NB. Callback convention: 0 for success, POSITIVE errno for
+            // failure - the caller negates it before getSystemErrorName(). A negative
+            // errno here would come back positive and make that function throw.
+            const rc = flock(fd, 2 | 4);
+            callback(rc === 0 ? 0 : koffi.errno());
+        },
+    };
+    return __flockAndroidBinding;
+}
+`;
+    const into = `    if (platform === 'android') return __tetherAndroidFlock();
+    if (platform !== 'linux' && platform !== 'darwin') {`;
+    await writeFile(filename, prelude + source.replace(anchor, into));
+    console.log("patched: flock: route android to koffi/libc flock(2) binding");
+  }
+}
+

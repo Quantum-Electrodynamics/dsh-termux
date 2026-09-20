@@ -115,6 +115,7 @@ const checks = [
     ? [[join("lib", profileFiles[0]), "process.execArgv.includes(\"--expose-internals\")"]]
     : []),
   [join("node_modules", "@deepseek-ai", "dsh-session-persistence-jsonl", "lib", "index.js"), "process.platform === \"android\""],
+  [join("node_modules", "@deepseek-ai", "node-addon-system", "lib", "flock.js"), "if (platform === 'android') return __tetherAndroidFlock();"],
 ];
 for (const [relativePath, needle] of checks) {
   const source = await readFile(join(root, relativePath), "utf8");

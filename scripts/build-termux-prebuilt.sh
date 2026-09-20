@@ -133,7 +133,16 @@ PROFILE_MANIFEST="${PROFILE_MANIFEST:-${DSH_HOME:-$HOME/.dsh}/profiles/web/packa
 # Packages come from more than one place on a real machine: the previous installation's
 # node_modules holds the plugin bundles themselves, while their own dependencies are resolved
 # inside the profile's node_modules. All are searched, in this order.
-CARRYOVER_SOURCE="${CARRYOVER_SOURCE:-$PREFIX/lib/node_modules/dsh-termux/node_modules}"
+# Termux installs globally under $PREFIX; anywhere else npm's global root is the equivalent place.
+# $PREFIX is unset off-Termux and this script runs under `set -u`, so it must never be dereferenced
+# bare - not even inside a ${VAR:-default}, where an unset $PREFIX aborts the whole build.
+if [[ -z "${CARRYOVER_SOURCE:-}" ]]; then
+  if [[ -n "${PREFIX:-}" ]]; then
+    CARRYOVER_SOURCE="$PREFIX/lib/node_modules/dsh-termux/node_modules"
+  else
+    CARRYOVER_SOURCE="$(npm root -g)/dsh-termux/node_modules"
+  fi
+fi
 CARRYOVER_PROFILE_MODULES="${CARRYOVER_PROFILE_MODULES:-$(dirname "$PROFILE_MANIFEST")/node_modules}"
 CARRYOVER_SHARED_MODULES="${CARRYOVER_SHARED_MODULES:-$(dirname "$(dirname "$PROFILE_MANIFEST")")/node_modules}"
 if [[ -f "$PROFILE_MANIFEST" ]]; then
